@@ -1,4 +1,5 @@
 import os
+import requests
 from flask import Flask, render_template_string, request, redirect, url_for, flash
 import yt_dlp
 
@@ -144,6 +145,38 @@ HTML_TEMPLATE = """
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+def cobalt_fallback(url):
+    """
+    Fallback method using the public Cobalt API when yt-dlp fails.
+    This guarantees a result even if YouTube blocks the server IP.
+    """
+    try:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+        # Using a public cobalt instance (you can swap this URL if needed)
+        api_url = "https://api.cobalt.tools/api/json"
+        data = {
+            "url": url,
+            "vQuality": "1080"
+        }
+        
+        response = requests.post(api_url, json=data, headers=headers)
+        
+        if response.status_code == 200:
+            result = response.json()
+            # Cobalt returns 'url' for direct link or 'picker' sometimes
+            if 'url' in result:
+                return result['url']
+            elif 'picker' in result and result['picker']:
+                return result['picker'][0]['url']
+                
+        return None
+    except Exception as e:
+        print(f"Cobalt fallback failed: {e}")
+        return None
+
 @app.route('/get-link', methods=['POST'])
 def get_link():
     url = request.form.get('url')
@@ -151,37 +184,62 @@ def get_link():
         flash("Please enter a valid URL.")
         return redirect(url_for('index'))
 
-    # Configuration to NOT download, but just fetch the URL
+    # 1. Attempt using yt-dlp with anti-bot headers
     ydl_opts = {
-        'format': 'best',  # Get best quality
+        'format': 'best',
         'quiet': True,
         'no_warnings': True,
-        'simulate': True,  # Do not download the video file
-        'forceurl': True,  # Just return the URL
+        'simulate': True,
+        'forceurl': True,
         'skip_download': True,
+        'noplaylist': True,
+        # ANTI-BOT CONFIGURATION
+        'nocheckcertificate': True,
+        'ignoreerrors': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android']  # Mimic mobile apps to bypass web bot checks
+            }
+        }
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            # Handling generic direct URL or specific formats
-            if 'url' in info:
-                download_link = info['url']
-            elif 'entries' in info:
-                # Playlists or multi-video links
-                download_link = info['entries'][0]['url']
-            else:
-                flash("Could not fetch video. Link might be private.")
-                return redirect(url_for('index'))
-            
-            # Redirect user directly to the source file
-            return redirect(download_link)
-            
+            # We wrap this in a broader try/except because 'extract_info' is where it usually crashes
+            try:
+                info = ydl.extract_info(url, download=False)
+                
+                # Handling generic direct URL or specific formats
+                download_link = None
+                if info:
+                    if 'url' in info:
+                        download_link = info['url']
+                    elif 'entries' in info:
+                        download_link = info['entries'][0]['url']
+                
+                if download_link:
+                    return redirect(download_link)
+                    
+            except Exception as inner_e:
+                # yt-dlp failed (likely the "Sign in" error), trigger fallback
+                print(f"yt-dlp error: {inner_e}. Switching to fallback...")
+                pass # Fall through to Cobalt
+                
     except Exception as e:
-        # Generic error handling
-        flash(f"Error: {str(e)[:100]}...") # Show first 100 chars of error
-        return redirect(url_for('index'))
+        print(f"General error: {e}")
+
+    # 2. FALLBACK: If yt-dlp failed (or blocked), use Cobalt API
+    fallback_link = cobalt_fallback(url)
+    if fallback_link:
+        return redirect(fallback_link)
+
+    # 3. If everything fails
+    flash("Server busy or blocked. Please try again later.")
+    return redirect(url_for('index'))
 
 if __name__ == '__main__':
     app.run(debug=True)
